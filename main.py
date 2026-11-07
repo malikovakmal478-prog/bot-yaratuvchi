@@ -27,6 +27,14 @@ TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 BLOCKED = ["subprocess", "os.system", "os.popen", "ctypes", "socket", "__import__",
            "platform.db", "DATA_DIR", "/var/data", "shutil", "eval(", "exec("]
 
+# Groq modellari ketma-ket sinab ko'riladi. Biri ishlamasa, keyingisi olinadi.
+GROQ_MODELS = [m for m in [os.environ.get("GROQ_MODEL", "").strip(),
+                           "openai/gpt-oss-120b",
+                           "llama-3.3-70b-versatile",
+                           "meta-llama/llama-4-scout-17b-16e-instruct",
+                           "llama-3.1-8b-instant"] if m]
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
+
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("hosting")
 app = Flask(__name__)
@@ -123,28 +131,36 @@ Rules:
 - Output ONLY the Python code. No explanations, no markdown."""
 
 def call_llm(messages):
-    last_err = None
+    errors = []
     with httpx.Client(timeout=120) as c:
         if GROQ_KEY:
-            try:
-                r = c.post("https://api.groq.com/openai/v1/chat/completions",
-                           headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                           json={"model": "llama-3.3-70b-versatile", "messages": messages, "temperature": 0.2})
-                if r.status_code != 200:
-                    raise RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
-                return r.json()["choices"][0]["message"]["content"]
-            except Exception as e:
-                log.warning("Groq failed: %s", e)
-                last_err = e
+            for model in GROQ_MODELS:
+                try:
+                    r = c.post("https://api.groq.com/openai/v1/chat/completions",
+                               headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                               json={"model": model, "messages": messages, "temperature": 0.2})
+                except Exception as e:
+                    errors.append(f"Groq {model}: {e}")
+                    break
+                if r.status_code == 200:
+                    return r.json()["choices"][0]["message"]["content"]
+                log.warning("Groq %s -> %s: %s", model, r.status_code, r.text[:200])
+                errors.append(f"Groq {model} {r.status_code}: {r.text[:150]}")
+                # Model topilmasa keyingisini sinaymiz, kalit/limit xatosi bo'lsa to'xtaymiz
+                if r.status_code not in (400, 404):
+                    break
         if OPENROUTER_KEY:
-            r = c.post("https://openrouter.ai/api/v1/chat/completions",
-                       headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                       json={"model": "meta-llama/llama-3.3-70b-instruct", "messages": messages, "temperature": 0.2})
-            if r.status_code != 200:
-                raise RuntimeError(f"OpenRouter {r.status_code}: {r.text[:300]}")
-            return r.json()["choices"][0]["message"]["content"]
-    if last_err:
-        raise last_err
+            try:
+                r = c.post("https://openrouter.ai/api/v1/chat/completions",
+                           headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                           json={"model": OPENROUTER_MODEL, "messages": messages, "temperature": 0.2})
+                if r.status_code == 200:
+                    return r.json()["choices"][0]["message"]["content"]
+                errors.append(f"OpenRouter {r.status_code}: {r.text[:150]}")
+            except Exception as e:
+                errors.append(f"OpenRouter: {e}")
+    if errors:
+        raise RuntimeError(" | ".join(errors))
     raise RuntimeError("AI kaliti sozlanmagan")
 
 def extract_code(text):
