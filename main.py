@@ -1,4 +1,4 @@
-import os, re, sys, uuid, shutil, sqlite3, hashlib, logging, subprocess, threading, time, resource
+import os, re, sys, uuid, shutil, sqlite3, hashlib, logging, subprocess, threading, time, resource, base64
 import httpx
 from flask import Flask, request, redirect, g, abort, render_template_string
 from cryptography.fernet import Fernet
@@ -9,7 +9,7 @@ BOTS_DIR = os.path.join(DATA_DIR, "bots")
 DB_PATH = os.path.join(DATA_DIR, "platform.db")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-FERNET = Fernet(os.environ["SECRET_KEY"].encode())
+FERNET = Fernet(base64.urlsafe_b64encode(hashlib.sha256(os.environ["SECRET_KEY"].encode()).digest()))
 MAX_BOTS_PER_VISITOR = 3
 MAX_RUNNING = 40
 TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
@@ -152,7 +152,10 @@ def generate_code(desc):
     raise RuntimeError("AI to'g'ri kod yoza olmadi")
 
 def check_token(token):
-    r = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15)
+    try:
+        r = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15)
+    except Exception:
+        return None
     if r.status_code != 200 or not r.json().get("ok"):
         return None
     return r.json()["result"]["username"]
@@ -208,7 +211,7 @@ form.inline{display:inline}
 <p class="muted">{{ b.description[:200] }}</p>
 <form class="inline" method="post" action="/bot/{{ b.id }}/start"><button>▶️ Ishga tushirish</button></form>
 <form class="inline" method="post" action="/bot/{{ b.id }}/stop"><button>⏹ To'xtatish</button></form>
-<form class="inline" method="post" action="/bot/{{ b.id }}/delete" onsubmit='return confirm("Botni ochirasizmi?")'><button class="danger">🗑 O'chirish</button></form>
+<form class="inline" method="post" action="/bot/{{ b.id }}/delete" onsubmit='return confirm("Botni o`chirasizmi?")'><button class="danger">🗑 O'chirish</button></form>
 </div>
 {% else %}<p class="muted">Hozircha botlar yo'q.</p>{% endfor %}
 </body></html>"""
@@ -260,7 +263,7 @@ def create():
 
 @app.post("/bot/<int:bot_id>/<action>")
 def bot_action(bot_id, action):
-    r = own_bot(bot_id)
+    own_bot(bot_id)
     if action == "start":
         if running_count() >= MAX_RUNNING:
             return render_index("Server band. Keyinroq urinib ko'ring.")
