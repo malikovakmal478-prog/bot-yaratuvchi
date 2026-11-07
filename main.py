@@ -3,12 +3,23 @@ import httpx
 from flask import Flask, request, redirect, g, abort, render_template_string
 from cryptography.fernet import Fernet
 
+def pick_data_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        test = os.path.join(path, ".write_test")
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+        return path
+    except OSError:
+        return "."
+
 PORT = int(os.environ.get("PORT", "10000"))
-DATA_DIR = os.environ.get("DATA_DIR", ".")
+DATA_DIR = pick_data_dir(os.environ.get("DATA_DIR", "."))
 BOTS_DIR = os.path.join(DATA_DIR, "bots")
 DB_PATH = os.path.join(DATA_DIR, "platform.db")
-GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 FERNET = Fernet(base64.urlsafe_b64encode(hashlib.sha256(os.environ["SECRET_KEY"].encode()).digest()))
 MAX_BOTS_PER_VISITOR = 3
 MAX_RUNNING = 40
@@ -22,6 +33,8 @@ app = Flask(__name__)
 procs = {}
 lock = threading.Lock()
 os.makedirs(BOTS_DIR, exist_ok=True)
+log.info("Ma'lumotlar papkasi: %s", os.path.abspath(DATA_DIR))
+log.info("GROQ key: %s, OPENROUTER key: %s", "bor" if GROQ_KEY else "yo'q", "bor" if OPENROUTER_KEY else "yo'q")
 
 # ---------- DB ----------
 def run_sql(sql, args=(), fetch=None):
@@ -48,7 +61,7 @@ def set_status(bot_id, status):
     run_sql("UPDATE bots SET status=? WHERE id=?", (status, bot_id))
 
 def limits():
-    mem = 512 * 1024 * 1024
+    mem = 1024 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
     fsize = 50 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
@@ -110,22 +123,28 @@ Rules:
 - Output ONLY the Python code. No explanations, no markdown."""
 
 def call_llm(messages):
+    last_err = None
     with httpx.Client(timeout=120) as c:
         if GROQ_KEY:
             try:
                 r = c.post("https://api.groq.com/openai/v1/chat/completions",
                            headers={"Authorization": f"Bearer {GROQ_KEY}"},
                            json={"model": "llama-3.3-70b-versatile", "messages": messages, "temperature": 0.2})
-                r.raise_for_status()
+                if r.status_code != 200:
+                    raise RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
                 return r.json()["choices"][0]["message"]["content"]
             except Exception as e:
                 log.warning("Groq failed: %s", e)
+                last_err = e
         if OPENROUTER_KEY:
             r = c.post("https://openrouter.ai/api/v1/chat/completions",
                        headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
                        json={"model": "meta-llama/llama-3.3-70b-instruct", "messages": messages, "temperature": 0.2})
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise RuntimeError(f"OpenRouter {r.status_code}: {r.text[:300]}")
             return r.json()["choices"][0]["message"]["content"]
+    if last_err:
+        raise last_err
     raise RuntimeError("AI kaliti sozlanmagan")
 
 def extract_code(text):
@@ -191,7 +210,7 @@ body{font-family:system-ui;max-width:640px;margin:24px auto;padding:0 16px;backg
 .card{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px #0001}
 textarea,input{width:100%;padding:10px;margin:6px 0 12px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
 button{background:#2b7de9;color:#fff;border:0;padding:8px 14px;border-radius:8px;cursor:pointer;margin:4px 4px 0 0}
-.danger{background:#e04848}.muted{color:#777;font-size:14px}.msg{background:#fff3cd;padding:10px;border-radius:8px}
+.danger{background:#e04848}.muted{color:#777;font-size:14px}.msg{background:#fff3cd;padding:10px;border-radius:8px;word-break:break-word}
 form.inline{display:inline}
 </style></head><body>
 <h2>🤖 AI Bot Yaratish</h2>
@@ -251,7 +270,7 @@ def create():
         code = generate_code(desc)
     except Exception as e:
         log.exception("Generation failed")
-        return render_index(f"AI xatosi: {str(e)[:200]}")
+        return render_index(f"AI xatosi: {str(e)[:300]}")
     bot_id = run_sql("INSERT INTO bots (visitor, username, description, token_enc, token_hash) VALUES (?,?,?,?,?)",
                      (g.vid, username, desc, FERNET.encrypt(token.encode()), th))
     bdir = os.path.join(BOTS_DIR, str(bot_id))
