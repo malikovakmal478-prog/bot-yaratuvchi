@@ -5,6 +5,7 @@ from cryptography.fernet import Fernet
 
 def pick_data_dir(path):
     try:
+        path = os.path.abspath(path)
         os.makedirs(path, exist_ok=True)
         test = os.path.join(path, ".write_test")
         with open(test, "w") as f:
@@ -12,12 +13,12 @@ def pick_data_dir(path):
         os.remove(test)
         return path
     except OSError:
-        return "."
+        return os.path.abspath(".")
 
 PORT = int(os.environ.get("PORT", "10000"))
 DATA_DIR = pick_data_dir(os.environ.get("DATA_DIR", "."))
-BOTS_DIR = os.path.join(DATA_DIR, "bots")
-DB_PATH = os.path.join(DATA_DIR, "platform.db")
+BOTS_DIR = os.path.abspath(os.path.join(DATA_DIR, "bots"))
+DB_PATH = os.path.abspath(os.path.join(DATA_DIR, "platform.db"))
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 FERNET = Fernet(base64.urlsafe_b64encode(hashlib.sha256(os.environ["SECRET_KEY"].encode()).digest()))
@@ -40,7 +41,7 @@ app = Flask(__name__)
 procs = {}
 lock = threading.Lock()
 os.makedirs(BOTS_DIR, exist_ok=True)
-log.info("Ma'lumotlar papkasi: %s", os.path.abspath(DATA_DIR))
+log.info("Ma'lumotlar papkasi: %s", DATA_DIR)
 log.info("GROQ key: %s, OPENROUTER key: %s", "bor" if GROQ_KEY else "yo'q", "bor" if OPENROUTER_KEY else "yo'q")
 
 # ---------- DB ----------
@@ -74,8 +75,11 @@ def limits():
 def running_count():
     return sum(1 for p in procs.values() if p.poll() is None)
 
+def bot_dir(bot_id):
+    return os.path.join(BOTS_DIR, str(bot_id))
+
 def bot_log_tail(bot_id, n=1500):
-    path = os.path.join(BOTS_DIR, str(bot_id), "bot.log")
+    path = os.path.join(bot_dir(bot_id), "bot.log")
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()[-n:]
@@ -84,21 +88,21 @@ def bot_log_tail(bot_id, n=1500):
 
 def start_bot(bot_id):
     """Botni ishga tushiradi. Xato bo'lsa xato matnini qaytaradi, muvaffaqiyatda None."""
-    p = None
     with lock:
         old = procs.get(bot_id)
         if old and old.poll() is None:
             return None
         r = run_sql("SELECT * FROM bots WHERE id=?", (bot_id,), "one")
         token = FERNET.decrypt(r["token_enc"]).decode()
-        bdir = os.path.join(BOTS_DIR, str(bot_id))
+        bdir = bot_dir(bot_id)
         os.makedirs(bdir, exist_ok=True)
+        script = os.path.join(bdir, "bot.py")
         env = {"PATH": os.environ.get("PATH", ""), "BOT_TOKEN": token,
                "PYTHONUNBUFFERED": "1", "HOME": bdir}
-        with open(os.path.join(bdir, "bot.log"), "a") as logf:
-            logf.write("\n--- start ---\n")
-        logf = open(os.path.join(bdir, "bot.log"), "a")
-        p = subprocess.Popen([sys.executable, os.path.join(bdir, "bot.py")],
+        logf = open(os.path.join(bdir, "bot.log"), "a", encoding="utf-8")
+        logf.write("\n--- start ---\n")
+        logf.flush()
+        p = subprocess.Popen([sys.executable, script],
                              cwd=bdir, env=env, stdout=logf,
                              stderr=subprocess.STDOUT, preexec_fn=limits)
         procs[bot_id] = p
@@ -319,7 +323,7 @@ def create():
         return render_index(f"AI xatosi: {str(e)[:300]}")
     bot_id = run_sql("INSERT INTO bots (visitor, username, description, token_enc, token_hash) VALUES (?,?,?,?,?)",
                      (g.vid, username, desc, FERNET.encrypt(token.encode()), th))
-    bdir = os.path.join(BOTS_DIR, str(bot_id))
+    bdir = bot_dir(bot_id)
     os.makedirs(bdir, exist_ok=True)
     with open(os.path.join(bdir, "bot.py"), "w", encoding="utf-8") as f:
         f.write(code)
@@ -344,7 +348,7 @@ def bot_action(bot_id, action):
     elif action == "delete":
         stop_bot(bot_id)
         run_sql("DELETE FROM bots WHERE id=?", (bot_id,))
-        shutil.rmtree(os.path.join(BOTS_DIR, str(bot_id)), ignore_errors=True)
+        shutil.rmtree(bot_dir(bot_id), ignore_errors=True)
     else:
         abort(404)
     return redirect("/")
