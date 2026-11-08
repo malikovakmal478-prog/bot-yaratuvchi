@@ -27,7 +27,6 @@ TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 BLOCKED = ["subprocess", "os.system", "os.popen", "ctypes", "socket", "__import__",
            "platform.db", "DATA_DIR", "/var/data", "shutil", "eval(", "exec("]
 
-# Groq modellari ketma-ket sinab ko'riladi. Biri ishlamasa, keyingisi olinadi.
 GROQ_MODELS = [m for m in [os.environ.get("GROQ_MODEL", "").strip(),
                            "openai/gpt-oss-120b",
                            "llama-3.3-70b-versatile",
@@ -69,30 +68,47 @@ def set_status(bot_id, status):
     run_sql("UPDATE bots SET status=? WHERE id=?", (status, bot_id))
 
 def limits():
-    mem = 1024 * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
     fsize = 50 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
 
 def running_count():
     return sum(1 for p in procs.values() if p.poll() is None)
 
+def bot_log_tail(bot_id, n=1500):
+    path = os.path.join(BOTS_DIR, str(bot_id), "bot.log")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()[-n:]
+    except OSError:
+        return ""
+
 def start_bot(bot_id):
+    """Botni ishga tushiradi. Xato bo'lsa xato matnini qaytaradi, muvaffaqiyatda None."""
+    p = None
     with lock:
-        p = procs.get(bot_id)
-        if p and p.poll() is None:
-            return
+        old = procs.get(bot_id)
+        if old and old.poll() is None:
+            return None
         r = run_sql("SELECT * FROM bots WHERE id=?", (bot_id,), "one")
         token = FERNET.decrypt(r["token_enc"]).decode()
         bdir = os.path.join(BOTS_DIR, str(bot_id))
         os.makedirs(bdir, exist_ok=True)
         env = {"PATH": os.environ.get("PATH", ""), "BOT_TOKEN": token,
                "PYTHONUNBUFFERED": "1", "HOME": bdir}
+        with open(os.path.join(bdir, "bot.log"), "a") as logf:
+            logf.write("\n--- start ---\n")
         logf = open(os.path.join(bdir, "bot.log"), "a")
-        procs[bot_id] = subprocess.Popen([sys.executable, os.path.join(bdir, "bot.py")],
-                                         cwd=bdir, env=env, stdout=logf,
-                                         stderr=subprocess.STDOUT, preexec_fn=limits)
+        p = subprocess.Popen([sys.executable, os.path.join(bdir, "bot.py")],
+                             cwd=bdir, env=env, stdout=logf,
+                             stderr=subprocess.STDOUT, preexec_fn=limits)
+        procs[bot_id] = p
+    time.sleep(4)
+    if p.poll() is not None:
+        set_status(bot_id, "crashed")
+        log.warning("Bot %s darhol to'xtadi", bot_id)
+        return bot_log_tail(bot_id) or "Noma'lum xato"
     set_status(bot_id, "running")
+    return None
 
 def stop_bot(bot_id):
     with lock:
@@ -118,10 +134,11 @@ def watchdog():
                     log.exception("Restart failed: %s", r["id"])
 
 # ---------- AI code generation ----------
-SYSTEM_PROMPT = """You are an expert Python developer. Write a COMPLETE, working Telegram bot in ONE Python file using python-telegram-bot v21 (async API).
+SYSTEM_PROMPT = """You are an expert Python developer. Write a COMPLETE, working Telegram bot in ONE Python file.
 Rules:
+- Use python-telegram-bot version 21 (async API). It is installed. Use only python-telegram-bot, the standard library and httpx.
 - Read the token only with os.environ["BOT_TOKEN"].
-- Build with Application.builder().token(...).build() and run with run_polling().
+- Build with Application.builder().token(os.environ["BOT_TOKEN"]).build(), register handlers, and end with app.run_polling(drop_pending_updates=True).
 - Do NOT use subprocess, os.system, os.popen, socket, ctypes, eval, exec, shutil or __import__.
 - Do NOT access files outside the current directory.
 - Store data in memory or in a local SQLite file named data.db.
@@ -146,7 +163,6 @@ def call_llm(messages):
                     return r.json()["choices"][0]["message"]["content"]
                 log.warning("Groq %s -> %s: %s", model, r.status_code, r.text[:200])
                 errors.append(f"Groq {model} {r.status_code}: {r.text[:150]}")
-                # Model topilmasa keyingisini sinaymiz, kalit/limit xatosi bo'lsa to'xtaymiz
                 if r.status_code not in (400, 404):
                     break
         if OPENROUTER_KEY:
@@ -225,8 +241,10 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 body{font-family:system-ui;max-width:640px;margin:24px auto;padding:0 16px;background:#f5f6fa}
 .card{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px #0001}
 textarea,input{width:100%;padding:10px;margin:6px 0 12px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
-button{background:#2b7de9;color:#fff;border:0;padding:8px 14px;border-radius:8px;cursor:pointer;margin:4px 4px 0 0}
-.danger{background:#e04848}.muted{color:#777;font-size:14px}.msg{background:#fff3cd;padding:10px;border-radius:8px;word-break:break-word}
+button,.btn{background:#2b7de9;color:#fff;border:0;padding:8px 14px;border-radius:8px;cursor:pointer;margin:4px 4px 0 0;text-decoration:none;display:inline-block;font-size:15px}
+.danger{background:#e04848}.muted{color:#777;font-size:14px}
+.msg{background:#fff3cd;padding:10px;border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:14px}
+pre{background:#111;color:#0f0;padding:10px;border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:13px}
 form.inline{display:inline}
 </style></head><body>
 <h2>🤖 AI Bot Yaratish</h2>
@@ -242,13 +260,25 @@ form.inline{display:inline}
 </form></div>
 <h3>Sizning botlaringiz</h3>
 {% for b in bots %}
-<div class="card"><b>@{{ b.username }}</b> — {{ "🟢 ishlayapti" if b.status == 'running' else "🔴 to'xtagan" }}
+<div class="card"><b>@{{ b.username }}</b> —
+{% if b.status == 'running' %}🟢 ishlayapti{% elif b.status == 'crashed' %}🔴 xato bilan to'xtagan{% else %}⚪ to'xtagan{% endif %}
 <p class="muted">{{ b.description[:200] }}</p>
 <form class="inline" method="post" action="/bot/{{ b.id }}/start"><button>▶️ Ishga tushirish</button></form>
 <form class="inline" method="post" action="/bot/{{ b.id }}/stop"><button>⏹ To'xtatish</button></form>
+<a class="btn" href="/bot/{{ b.id }}/log">📄 Log</a>
 <form class="inline" method="post" action="/bot/{{ b.id }}/delete" onsubmit='return confirm("Botni o`chirasizmi?")'><button class="danger">🗑 O'chirish</button></form>
 </div>
 {% else %}<p class="muted">Hozircha botlar yo'q.</p>{% endfor %}
+</body></html>"""
+
+LOG_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Log</title>
+<style>body{font-family:system-ui;max-width:640px;margin:24px auto;padding:0 16px;background:#f5f6fa}
+pre{background:#111;color:#0f0;padding:10px;border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:13px}
+a{color:#2b7de9}</style></head><body>
+<p><a href="/">← Orqaga</a></p><h3>@{{ b.username }} — log</h3>
+<pre>{{ log_text or "Log bo'sh" }}</pre>
 </body></html>"""
 
 def render_index(msg=""):
@@ -293,16 +323,22 @@ def create():
     os.makedirs(bdir, exist_ok=True)
     with open(os.path.join(bdir, "bot.py"), "w", encoding="utf-8") as f:
         f.write(code)
-    start_bot(bot_id)
+    err = start_bot(bot_id)
+    if err:
+        return render_index(f"Bot yaratildi, lekin ishga tushmadi. Xato:\n{err}")
     return redirect("/")
 
-@app.post("/bot/<int:bot_id>/<action>")
+@app.route("/bot/<int:bot_id>/<action>", methods=["GET", "POST"])
 def bot_action(bot_id, action):
+    if request.method == "GET":
+        return redirect("/")
     own_bot(bot_id)
     if action == "start":
         if running_count() >= MAX_RUNNING:
             return render_index("Server band. Keyinroq urinib ko'ring.")
-        start_bot(bot_id)
+        err = start_bot(bot_id)
+        if err:
+            return render_index(f"Bot ishga tushmadi. Xato:\n{err}")
     elif action == "stop":
         stop_bot(bot_id)
     elif action == "delete":
@@ -312,6 +348,11 @@ def bot_action(bot_id, action):
     else:
         abort(404)
     return redirect("/")
+
+@app.get("/bot/<int:bot_id>/log")
+def bot_log_page(bot_id):
+    r = own_bot(bot_id)
+    return render_template_string(LOG_PAGE, b=r, log_text=bot_log_tail(bot_id, 4000))
 
 # ---------- Main ----------
 if __name__ == "__main__":
